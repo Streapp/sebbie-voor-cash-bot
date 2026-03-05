@@ -1,5 +1,8 @@
 ﻿require("dotenv").config();
 
+const fs = require("fs");
+const path = require("path");
+
 const {
   Client,
   GatewayIntentBits,
@@ -28,6 +31,45 @@ if (!token) {
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
+
+// -------------------------
+// ✅ PERSISTENTE AUDIT LOG (Render Disk)
+// -------------------------
+// Op Render mounten we een disk op /var/data.
+// Lokaal bestaat dat pad niet, daarom gebruiken we lokaal ./data als fallback.
+const AUDIT_DIR =
+  process.env.AUDIT_DIR ||
+  (fs.existsSync("/var/data") ? "/var/data" : path.join(__dirname, "..", "data"));
+
+const AUDIT_FILE = path.join(AUDIT_DIR, "audit.log");
+
+function ensureAuditDir() {
+  try {
+    if (!fs.existsSync(AUDIT_DIR)) {
+      fs.mkdirSync(AUDIT_DIR, { recursive: true });
+    }
+  } catch (e) {
+    console.error("⚠️ Kan audit map niet maken:", e);
+  }
+}
+
+function appendAuditLog(text) {
+  try {
+    ensureAuditDir();
+
+    const safeText = (text || "").toString();
+    const entry = [
+      "----------------------------------------",
+      `Tijdstip: ${nowNl()}`,
+      safeText,
+      "",
+    ].join("\n");
+
+    fs.appendFileSync(AUDIT_FILE, entry, { encoding: "utf8" });
+  } catch (e) {
+    console.error("⚠️ Kan audit log niet wegschrijven:", e);
+  }
+}
 
 // channelId -> state
 // Let op: missingValues bevat tijdelijk gevoelige info (alleen in memory, niet in logs).
@@ -186,7 +228,11 @@ function buildCopyButtonsRow(values) {
   }
   if (values.city) {
     buttons.push(
-      new ButtonBuilder().setCustomId("copy_val_city").setLabel("Kopieer Woonplaats").setStyle(ButtonStyle.Primary).setEmoji("📋")
+      new ButtonBuilder()
+        .setCustomId("copy_val_city")
+        .setLabel("Kopieer Woonplaats")
+        .setStyle(ButtonStyle.Primary)
+        .setEmoji("📋")
     );
   }
   if (values.iban) {
@@ -230,6 +276,10 @@ function buildMemberFillRowActive() {
 }
 
 async function logToChannel(guild, message) {
+  // ✅ 1) altijd naar audit log wegschrijven (ook als Discord kanaal niet bereikbaar is)
+  appendAuditLog(message);
+
+  // ✅ 2) daarnaast zoals altijd naar Discord log kanaal
   if (!LOG_CHANNEL_ID) return;
   const logChannel = await guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
   if (!logChannel) return;
@@ -248,7 +298,9 @@ async function disableMemberFillButtonInChannel(channel) {
 
   const target = messages.find((m) => {
     if (!m.components || !m.components.length) return false;
-    return m.components.some((row) => row.components?.some((c) => c.customId === "member_fill_missing_data" && c.disabled === false));
+    return m.components.some((row) =>
+      row.components?.some((c) => c.customId === "member_fill_missing_data" && c.disabled === false)
+    );
   });
 
   if (!target) return;
@@ -295,6 +347,9 @@ client.once(Events.ClientReady, (c) => {
   console.log(`✅ Bot is online als: ${c.user.tag}`);
   if (!TICKETS_CATEGORY_ID) console.log("⚠️ Let op: TICKETS_CATEGORY_ID ontbreekt nog in .env");
   if (!LOG_CHANNEL_ID) console.log("⚠️ Let op: LOG_CHANNEL_ID ontbreekt nog in .env (logging werkt dan niet).");
+
+  // ✅ Laat zien waar audit logging naartoe schrijft (handig bij debug)
+  console.log(`🧾 Audit log pad: ${AUDIT_FILE}`);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -521,16 +576,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
             .catch(() => {});
         }
 
-        await logToChannel(interaction.guild, [
-          `🟡 **Ticket geannuleerd (door lid, afgesloten door admin)**`,
-          `Lid: <@${aanvragerId}>`,
-          `Ingewisseld: ${punten} Sebbie (aanvraag)`,
-          `Bedrag: €${euro}`,
-          `Reden: ${reason}`,
-          `Tijdstip: ${nowNl()}`,
-          `Admin: <@${interaction.user.id}>`,
-          `Kanaal: #${channel.name}`,
-        ].join("\n"));
+        await logToChannel(
+          interaction.guild,
+          [
+            `🟡 **Ticket geannuleerd (door lid, afgesloten door admin)**`,
+            `Lid: <@${aanvragerId}>`,
+            `Ingewisseld: ${punten} Sebbie (aanvraag)`,
+            `Bedrag: €${euro}`,
+            `Reden: ${reason}`,
+            `Tijdstip: ${nowNl()}`,
+            `Admin: <@${interaction.user.id}>`,
+            `Kanaal: #${channel.name}`,
+          ].join("\n")
+        );
 
         await replyTemp(interaction, "✅ Ticket wordt afgesloten.");
         ticketState.delete(channel.id);
@@ -806,16 +864,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
             .catch(() => {});
         }
 
-        await logToChannel(interaction.guild, [
-          `🔴 **Ticket afgekeurd (afgesloten door admin)**`,
-          `Lid: <@${aanvragerId}>`,
-          `Ingewisseld: ${punten} Sebbie (aanvraag)`,
-          `Bedrag: €${euro}`,
-          `Reden afkeuring: ${reason}`,
-          `Tijdstip: ${nowNl()}`,
-          `Admin: <@${interaction.user.id}>`,
-          `Kanaal: #${channel.name}`,
-        ].join("\n"));
+        await logToChannel(
+          interaction.guild,
+          [
+            `🔴 **Ticket afgekeurd (afgesloten door admin)**`,
+            `Lid: <@${aanvragerId}>`,
+            `Ingewisseld: ${punten} Sebbie (aanvraag)`,
+            `Bedrag: €${euro}`,
+            `Reden afkeuring: ${reason}`,
+            `Tijdstip: ${nowNl()}`,
+            `Admin: <@${interaction.user.id}>`,
+            `Kanaal: #${channel.name}`,
+          ].join("\n")
+        );
 
         await replyTemp(interaction, "✅ Afkeuring verstuurd. Ticket wordt afgesloten.");
 
@@ -880,16 +941,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
             .catch(() => {});
         }
 
-        await logToChannel(interaction.guild, [
-          `💰 **Betaalde aanvraag**`,
-          `Lid: <@${aanvragerId}>`,
-          `Ingewisseld: ${punten} Sebbie`,
-          `Bedrag: €${euro}`,
-          `Koopovereenkomst: ${agreementNo}`,
-          `Tijdstip: ${nowNl()}`,
-          `Admin: <@${interaction.user.id}>`,
-          `Kanaal: #${channel.name}`,
-        ].join("\n"));
+        await logToChannel(
+          interaction.guild,
+          [
+            `💰 **Betaalde aanvraag**`,
+            `Lid: <@${aanvragerId}>`,
+            `Ingewisseld: ${punten} Sebbie`,
+            `Bedrag: €${euro}`,
+            `Koopovereenkomst: ${agreementNo}`,
+            `Tijdstip: ${nowNl()}`,
+            `Admin: <@${interaction.user.id}>`,
+            `Kanaal: #${channel.name}`,
+          ].join("\n")
+        );
 
         await replyTemp(interaction, "✅ Betaald geregistreerd. Ticket wordt gesloten.");
 
