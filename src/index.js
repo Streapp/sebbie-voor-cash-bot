@@ -33,7 +33,7 @@ const client = new Client({
 });
 
 // -------------------------
-// ✅ PERSISTENTE AUDIT LOG (Render Disk)
+// ✅ PERSISTENTE AUDIT LOG (Render Disk) - per dag bestand
 // -------------------------
 // Op Render mounten we een disk op /var/data.
 // Lokaal bestaat dat pad niet, daarom gebruiken we lokaal ./data als fallback.
@@ -41,7 +41,38 @@ const AUDIT_DIR =
   process.env.AUDIT_DIR ||
   (fs.existsSync("/var/data") ? "/var/data" : path.join(__dirname, "..", "data"));
 
-const AUDIT_FILE = path.join(AUDIT_DIR, "audit.log");
+function nowNl() {
+  return new Date().toLocaleString("nl-NL", {
+    timeZone: "Europe/Amsterdam",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+// Bestandsdatum voor NL-tijdzone (YYYY-MM-DD) -> audit-YYYY-MM-DD.log
+function dateKeyNl() {
+  const parts = new Intl.DateTimeFormat("nl-NL", {
+    timeZone: "Europe/Amsterdam",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+
+  const y = parts.find((p) => p.type === "year")?.value;
+  const m = parts.find((p) => p.type === "month")?.value;
+  const d = parts.find((p) => p.type === "day")?.value;
+
+  return `${y}-${m}-${d}`; // YYYY-MM-DD
+}
+
+function auditFilePathForToday() {
+  const key = dateKeyNl();
+  return path.join(AUDIT_DIR, `audit-${key}.log`);
+}
 
 function ensureAuditDir() {
   try {
@@ -58,6 +89,8 @@ function appendAuditLog(text) {
     ensureAuditDir();
 
     const safeText = (text || "").toString();
+    const filePath = auditFilePathForToday();
+
     const entry = [
       "----------------------------------------",
       `Tijdstip: ${nowNl()}`,
@@ -65,7 +98,7 @@ function appendAuditLog(text) {
       "",
     ].join("\n");
 
-    fs.appendFileSync(AUDIT_FILE, entry, { encoding: "utf8" });
+    fs.appendFileSync(filePath, entry, { encoding: "utf8" });
   } catch (e) {
     console.error("⚠️ Kan audit log niet wegschrijven:", e);
   }
@@ -100,18 +133,6 @@ function parseTicketTopic(topic) {
 
 function isAdmin(interaction) {
   return interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels);
-}
-
-function nowNl() {
-  return new Date().toLocaleString("nl-NL", {
-    timeZone: "Europe/Amsterdam",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
 }
 
 // ✅ FIX: voorkom "Unknown interaction" (10062) + ✅ geen ephemeral-deprecation warning meer (gebruik flags)
@@ -349,7 +370,8 @@ client.once(Events.ClientReady, (c) => {
   if (!LOG_CHANNEL_ID) console.log("⚠️ Let op: LOG_CHANNEL_ID ontbreekt nog in .env (logging werkt dan niet).");
 
   // ✅ Laat zien waar audit logging naartoe schrijft (handig bij debug)
-  console.log(`🧾 Audit log pad: ${AUDIT_FILE}`);
+  console.log(`🧾 Audit log map: ${AUDIT_DIR}`);
+  console.log(`🧾 Audit log bestand vandaag: ${auditFilePathForToday()}`);
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
