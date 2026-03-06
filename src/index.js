@@ -106,6 +106,8 @@ function appendAuditLog(text) {
 //   status: string,
 //   closed?: boolean,
 //   ticketName?: string,
+//   ticketUrl?: string,
+//   openedAt?: string,
 //   meta?: { userId, euro, punten },
 //   cancelReason?: string,
 //   rejectReason?: string,
@@ -457,9 +459,13 @@ async function getAdminDmChannel(userId) {
 function buildAdminStatusText(state) {
   const meta = state.meta || {};
   const ticketName = state.ticketName || "onbekend";
+  const openedAt = state.openedAt || "onbekend";
+  const ticketUrl = state.ticketUrl || "onbekend";
 
   const lines = [
     `🔐 **Adminbediening Sebbie voor Cash**`,
+    `Geopend: **${openedAt}**`,
+    `Ticketlink: ${ticketUrl}`,
     `Kanaal: **#${ticketName}**`,
     `Aanvrager: <@${meta.userId || "onbekend"}>`,
     `Bedrag: **€${meta.euro ?? "?"}**`,
@@ -639,6 +645,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
 
         const meta = { userId: lid.id, euro, punten };
+        const openedAt = nowNl();
+        const ticketUrl = `https://discord.com/channels/${ticketChannel.guildId}/${ticketChannel.id}`;
 
         ticketState.set(ticketChannel.id, {
           approved: false,
@@ -646,6 +654,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           status: "Openstaand",
           closed: false,
           ticketName: ticketChannel.name,
+          ticketUrl,
+          openedAt,
           meta,
         });
 
@@ -1307,6 +1317,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           ticketName: channel.name,
           meta: state.meta || meta,
         });
+
+        await disableMemberCancelButtonInChannel(channel);
 
         await channel.send({
           content: [`🟡 **Aanvraag geannuleerd door lid**`, `Reden: ${reason}`].join("\n"),
