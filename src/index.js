@@ -33,7 +33,7 @@ const client = new Client({
 });
 
 // -------------------------
-// ✅ PERSISTENTE AUDIT LOG (Render Disk) - per dag bestand
+// PERSISTENTE AUDIT LOG
 // -------------------------
 const AUDIT_DIR =
   process.env.AUDIT_DIR ||
@@ -67,8 +67,7 @@ function dateKeyNl() {
 }
 
 function auditFilePathForToday() {
-  const key = dateKeyNl();
-  return path.join(AUDIT_DIR, `audit-${key}.log`);
+  return path.join(AUDIT_DIR, `audit-${dateKeyNl()}.log`);
 }
 
 function ensureAuditDir() {
@@ -85,27 +84,35 @@ function appendAuditLog(text) {
   try {
     ensureAuditDir();
 
-    const safeText = (text || "").toString();
-    const filePath = auditFilePathForToday();
-
     const entry = [
       "----------------------------------------",
       `Tijdstip: ${nowNl()}`,
-      safeText,
+      (text || "").toString(),
       "",
     ].join("\n");
 
-    fs.appendFileSync(filePath, entry, { encoding: "utf8" });
+    fs.appendFileSync(auditFilePathForToday(), entry, { encoding: "utf8" });
   } catch (e) {
     console.error("⚠️ Kan audit log niet wegschrijven:", e);
   }
 }
 
-// channelId -> state
-// Let op: missingValues bevat tijdelijk gevoelige info (alleen in memory, niet in logs).
+// -------------------------
+// STATE
+// -------------------------
+// channelId -> {
+//   approved: boolean,
+//   adminUserId: string,
+//   cancelReason?: string,
+//   rejectReason?: string,
+//   missingFields?: string[],
+//   missingValues?: object,
+//   adminDmChannelId?: string,
+//   adminControlMessageId?: string,
+//   missingDataAdminMessageId?: string,
+//   missingDataTicketNoticeMessageId?: string
+// }
 const ticketState = new Map();
-// adminSpaceId -> ticketChannelId
-const adminSpaceToTicket = new Map();
 
 function kaartNaarData(kaartValue) {
   const euro = Number(kaartValue);
@@ -146,12 +153,12 @@ async function replyTemp(interaction, content, ms = 8000) {
 
     if (interaction.replied) {
       const msg = await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
-      safeTimeout(() => msg.delete());
+      safeTimeout(() => msg.delete().catch(() => {}));
       return;
     }
 
     await interaction.reply({ content, flags: MessageFlags.Ephemeral });
-    safeTimeout(() => interaction.deleteReply());
+    safeTimeout(() => interaction.deleteReply().catch(() => {}));
   } catch (err) {
     if (err?.code === 10062) return;
 
@@ -159,7 +166,7 @@ async function replyTemp(interaction, content, ms = 8000) {
       if (!interaction.deferred && !interaction.replied) {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
         await interaction.editReply({ content }).catch(() => {});
-        safeTimeout(() => interaction.deleteReply());
+        safeTimeout(() => interaction.deleteReply().catch(() => {}));
       }
     } catch {
       // niks
@@ -171,6 +178,57 @@ async function sendTemp(channel, content, ms = 10000) {
   const msg = await channel.send(content);
   setTimeout(() => msg.delete().catch(() => {}), ms);
   return msg;
+}
+
+function safeForCodeBlock(text) {
+  return (text || "").toString().replace(/```/g, "'''\n").replace(/`/g, "'");
+}
+
+function fieldsToHumanList(fields) {
+  const map = {
+    firstName: "Voornaam",
+    lastName: "Achternaam",
+    city: "Woonplaats",
+    iban: "Rekeningnummer",
+  };
+  return fields.map((f) => map[f] || f);
+}
+
+async function logToChannel(guild, message) {
+  appendAuditLog(message);
+
+  if (!LOG_CHANNEL_ID) return;
+  const logChannel = await guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+  if (!logChannel) return;
+  if (logChannel.type !== ChannelType.GuildText) return;
+  await logChannel.send(message).catch(() => {});
+}
+
+async function getMemberDisplayName(guild, userId) {
+  try {
+    const member = await guild.members.fetch(userId);
+    if (member?.displayName) return member.displayName;
+    if (member?.user?.globalName) return member.user.globalName;
+    if (member?.user?.username) return member.user.username;
+  } catch {}
+
+  try {
+    const user = await client.users.fetch(userId);
+    return user.globalName || user.username || "lid";
+  } catch {}
+
+  return "lid";
+}
+
+function slugifyChannelName(input) {
+  return (input || "")
+    .toString()
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9\-]/g, "")
+    .replace(/\-+/g, "-")
+    .replace(/^\-+|\-+$/g, "");
 }
 
 function memberInitialRow() {
@@ -189,107 +247,9 @@ function memberCancelDisabledRow() {
   );
 }
 
-function adminInitialRow() {
+function buildMemberFillRowActive() {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("ticket_accept").setLabel("Accepteren").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("ticket_reject").setLabel("Afkeuren").setStyle(ButtonStyle.Danger)
-  );
-}
-
-function adminCancelRow() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("admin_close_cancel").setLabel("Aanvraag annuleren").setStyle(ButtonStyle.Danger)
-  );
-}
-
-function adminAfterAcceptRow() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("ticket_paid").setLabel("Betaald").setStyle(ButtonStyle.Success).setEmoji("💰"),
-    new ButtonBuilder()
-      .setCustomId("ticket_missing_data")
-      .setLabel("Ontbrekende gegevens")
-      .setStyle(ButtonStyle.Secondary)
-      .setEmoji("📋")
-  );
-}
-
-function missingFieldsSelectRow() {
-  const select = new StringSelectMenuBuilder()
-    .setCustomId("select_missing_fields")
-    .setPlaceholder("Selecteer welke gegevens ontbreken (1 of meer)")
-    .setMinValues(1)
-    .setMaxValues(4)
-    .addOptions(
-      { label: "Voornaam", value: "firstName" },
-      { label: "Achternaam", value: "lastName" },
-      { label: "Woonplaats", value: "city" },
-      { label: "Rekeningnummer", value: "iban" }
-    );
-
-  return new ActionRowBuilder().addComponents(select);
-}
-
-function fieldsToHumanList(fields) {
-  const map = {
-    firstName: "Voornaam",
-    lastName: "Achternaam",
-    city: "Woonplaats",
-    iban: "Rekeningnummer",
-  };
-  return fields.map((f) => map[f] || f);
-}
-
-function buildCopyButtonsRow(values) {
-  const buttons = [];
-
-  if (values.firstName) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId("copy_val_firstName")
-        .setLabel("Kopieer Voornaam")
-        .setStyle(ButtonStyle.Primary)
-        .setEmoji("📋")
-    );
-  }
-  if (values.lastName) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId("copy_val_lastName")
-        .setLabel("Kopieer Achternaam")
-        .setStyle(ButtonStyle.Primary)
-        .setEmoji("📋")
-    );
-  }
-  if (values.city) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId("copy_val_city")
-        .setLabel("Kopieer Woonplaats")
-        .setStyle(ButtonStyle.Primary)
-        .setEmoji("📋")
-    );
-  }
-  if (values.iban) {
-    buttons.push(
-      new ButtonBuilder()
-        .setCustomId("copy_val_iban")
-        .setLabel("Kopieer Rekeningnr")
-        .setStyle(ButtonStyle.Primary)
-        .setEmoji("📋")
-    );
-  }
-
-  if (!buttons.length) return null;
-  return new ActionRowBuilder().addComponents(...buttons);
-}
-
-function adminWipeDataRow() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("admin_wipe_missing_data")
-      .setLabel("Aanvullende gegevens wissen")
-      .setStyle(ButtonStyle.Danger)
-      .setEmoji("🗑")
+    new ButtonBuilder().setCustomId("member_fill_missing_data").setLabel("Gegevens invullen").setStyle(ButtonStyle.Primary)
   );
 }
 
@@ -303,24 +263,122 @@ function buildMemberFillRowDisabled() {
   );
 }
 
-function buildMemberFillRowActive() {
+function missingFieldsSelectRow(ticketChannelId) {
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`select_missing_fields:${ticketChannelId}`)
+    .setPlaceholder("Selecteer welke gegevens ontbreken (1 of meer)")
+    .setMinValues(1)
+    .setMaxValues(4)
+    .addOptions(
+      { label: "Voornaam", value: "firstName" },
+      { label: "Achternaam", value: "lastName" },
+      { label: "Woonplaats", value: "city" },
+      { label: "Rekeningnummer", value: "iban" }
+    );
+
+  return new ActionRowBuilder().addComponents(select);
+}
+
+function buildCopyButtonsRow(ticketChannelId, values) {
+  const buttons = [];
+
+  if (values.firstName) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`copy_val_firstName:${ticketChannelId}`)
+        .setLabel("Kopieer Voornaam")
+        .setStyle(ButtonStyle.Primary)
+        .setEmoji("📋")
+    );
+  }
+  if (values.lastName) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`copy_val_lastName:${ticketChannelId}`)
+        .setLabel("Kopieer Achternaam")
+        .setStyle(ButtonStyle.Primary)
+        .setEmoji("📋")
+    );
+  }
+  if (values.city) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`copy_val_city:${ticketChannelId}`)
+        .setLabel("Kopieer Woonplaats")
+        .setStyle(ButtonStyle.Primary)
+        .setEmoji("📋")
+    );
+  }
+  if (values.iban) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId(`copy_val_iban:${ticketChannelId}`)
+        .setLabel("Kopieer Rekeningnr")
+        .setStyle(ButtonStyle.Primary)
+        .setEmoji("📋")
+    );
+  }
+
+  if (!buttons.length) return null;
+  return new ActionRowBuilder().addComponents(...buttons);
+}
+
+function adminWipeDataRow(ticketChannelId) {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("member_fill_missing_data").setLabel("Gegevens invullen").setStyle(ButtonStyle.Primary)
+    new ButtonBuilder()
+      .setCustomId(`admin_wipe_missing_data:${ticketChannelId}`)
+      .setLabel("Aanvullende gegevens wissen")
+      .setStyle(ButtonStyle.Danger)
+      .setEmoji("🗑")
   );
 }
 
-async function logToChannel(guild, message) {
-  appendAuditLog(message);
+function buildAdminControlRows(ticketChannelId, state) {
+  const rows = [];
 
-  if (!LOG_CHANNEL_ID) return;
-  const logChannel = await guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
-  if (!logChannel) return;
-  if (logChannel.type !== ChannelType.GuildText) return;
-  await logChannel.send(message).catch(() => {});
+  if (!state.approved && !state.cancelReason) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`ticket_accept:${ticketChannelId}`).setLabel("Accepteren").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`ticket_reject:${ticketChannelId}`).setLabel("Afkeuren").setStyle(ButtonStyle.Danger)
+      )
+    );
+  }
+
+  if (state.approved) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`ticket_paid:${ticketChannelId}`)
+          .setLabel("Betaald")
+          .setStyle(ButtonStyle.Success)
+          .setEmoji("💰"),
+        new ButtonBuilder()
+          .setCustomId(`ticket_missing_data:${ticketChannelId}`)
+          .setLabel("Ontbrekende gegevens")
+          .setStyle(ButtonStyle.Secondary)
+          .setEmoji("📋")
+      )
+    );
+  }
+
+  if (state.cancelReason) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`admin_close_cancel:${ticketChannelId}`)
+          .setLabel("Aanvraag annuleren")
+          .setStyle(ButtonStyle.Danger)
+      )
+    );
+  }
+
+  return rows;
 }
 
-function safeForCodeBlock(text) {
-  return (text || "").toString().replace(/```/g, "'''\n").replace(/`/g, "'");
+function extractTicketId(customId, prefix) {
+  if (!customId.startsWith(`${prefix}:`)) return null;
+  return customId.slice(prefix.length + 1);
 }
 
 async function disableMemberFillButtonInChannel(channel) {
@@ -367,179 +425,102 @@ async function disableMemberCancelButtonInChannel(channel) {
   await target.edit({ components: newComponents }).catch(() => {});
 }
 
-async function getMemberDisplayName(guild, userId) {
-  try {
-    const member = await guild.members.fetch(userId);
-    if (member?.displayName) return member.displayName;
-    if (member?.user?.globalName) return member.user.globalName;
-    if (member?.user?.username) return member.user.username;
-  } catch {}
-
-  try {
-    const user = await client.users.fetch(userId);
-    return user.globalName || user.username || "lid";
-  } catch {}
-
-  return "lid";
-}
-
-function slugifyChannelName(input) {
-  return (input || "")
-    .toString()
-    .toLowerCase()
-    .trim()
-    .replace(/\s+/g, "-")
-    .replace(/[^a-z0-9\-]/g, "")
-    .replace(/\-+/g, "-")
-    .replace(/^\-+|\-+$/g, "");
-}
-
-function isPrivateThreadChannel(channel) {
-  return channel?.type === ChannelType.PrivateThread;
-}
-
-function isAdminWorkspaceChannel(channel) {
-  if (!channel) return false;
-  if (isPrivateThreadChannel(channel)) return true;
-  return adminSpaceToTicket.has(channel.id);
-}
-
-async function createAdminWorkspaceForTicket(ticketChannel, adminUserId) {
-  const botId = client.user.id;
-
-  try {
-    const starter = await ticketChannel.send("🔐 Adminruimte wordt voorbereid...");
-    const thread = await starter.startThread({
-      name: "admin-acties",
-      autoArchiveDuration: 10080,
-      type: ChannelType.PrivateThread,
-      reason: "Privé admin-acties voor Sebbie voor Cash ticket",
-    });
-
-    if (adminUserId) {
-      await thread.members.add(adminUserId).catch(() => {});
-    }
-
-    await starter.delete().catch(() => {});
-
-    return {
-      channel: thread,
-      type: "thread",
-    };
-  } catch (err) {
-    console.log("⚠️ Privé admin-thread kon niet worden gemaakt, fallback naar verborgen admin-kanaal.");
-
-    const hiddenName = `admin-${ticketChannel.name}`.slice(0, 90);
-
-    const hiddenChannel = await ticketChannel.guild.channels.create({
-      name: hiddenName,
-      type: ChannelType.GuildText,
-      parent: ticketChannel.parentId || undefined,
-      topic: `Adminruimte voor ticket ${ticketChannel.id}`,
-      permissionOverwrites: [
-        { id: ticketChannel.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-        {
-          id: botId,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.ManageChannels,
-          ],
-        },
-        {
-          id: adminUserId,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.ManageChannels,
-          ],
-        },
-      ],
-    });
-
-    return {
-      channel: hiddenChannel,
-      type: "channel",
-    };
+async function getTicketChannelById(ticketChannelId) {
+  for (const guild of client.guilds.cache.values()) {
+    const ch = await guild.channels.fetch(ticketChannelId).catch(() => null);
+    if (ch) return ch;
   }
-}
-
-async function getAdminWorkspaceForTicket(ticketChannel) {
-  const state = ticketState.get(ticketChannel.id) || {};
-  const adminSpaceId = state.adminSpaceId;
-  if (!adminSpaceId) return null;
-
-  if (adminSpaceToTicket.has(adminSpaceId)) {
-    return await ticketChannel.guild.channels.fetch(adminSpaceId).catch(() => null);
-  }
-
-  const ch = await ticketChannel.guild.channels.fetch(adminSpaceId).catch(() => null);
-  return ch || null;
-}
-
-async function deleteAdminWorkspaceForTicket(ticketChannel) {
-  const state = ticketState.get(ticketChannel.id) || {};
-  const adminSpaceId = state.adminSpaceId;
-  if (!adminSpaceId) return;
-
-  const ch = await ticketChannel.guild.channels.fetch(adminSpaceId).catch(() => null);
-  if (ch) {
-    await ch.delete("Sebbie voor Cash adminruimte sluiten").catch(() => {});
-  }
-
-  adminSpaceToTicket.delete(adminSpaceId);
-}
-
-async function resolveTicketContext(interaction) {
-  const channel = interaction.channel;
-  if (!channel) return null;
-
-  if (channel.type === ChannelType.GuildText) {
-    const meta = parseTicketTopic(channel.topic);
-    if (meta) {
-      return {
-        ticketChannel: channel,
-        currentChannel: channel,
-        inAdminWorkspace: false,
-        meta,
-      };
-    }
-
-    if (adminSpaceToTicket.has(channel.id)) {
-      const ticketId = adminSpaceToTicket.get(channel.id);
-      const ticketChannel = await channel.guild.channels.fetch(ticketId).catch(() => null);
-      if (!ticketChannel || ticketChannel.type !== ChannelType.GuildText) return null;
-
-      const ticketMeta = parseTicketTopic(ticketChannel.topic);
-      if (!ticketMeta) return null;
-
-      return {
-        ticketChannel,
-        currentChannel: channel,
-        inAdminWorkspace: true,
-        meta: ticketMeta,
-      };
-    }
-  }
-
-  if (isPrivateThreadChannel(channel)) {
-    const parent = channel.parent;
-    if (!parent || parent.type !== ChannelType.GuildText) return null;
-
-    const meta = parseTicketTopic(parent.topic);
-    if (!meta) return null;
-
-    return {
-      ticketChannel: parent,
-      currentChannel: channel,
-      inAdminWorkspace: true,
-      meta,
-    };
-  }
-
   return null;
+}
+
+async function getAdminDmChannel(userId) {
+  const user = await client.users.fetch(userId).catch(() => null);
+  if (!user) return null;
+  return await user.createDM().catch(() => null);
+}
+
+function buildAdminStatusText(ticketChannel, state, meta) {
+  const lines = [
+    `🔐 **Adminbediening Sebbie voor Cash**`,
+    `Ticket: ${ticketChannel}`,
+    `Aanvrager: <@${meta.userId}>`,
+    `Bedrag: **€${meta.euro}**`,
+    `Sebbie: **${meta.punten}**`,
+    ``,
+    `Status: ${state.cancelReason ? "Geannuleerd door lid" : state.approved ? "Goedgekeurd" : "Openstaand"}`,
+  ];
+
+  if (state.cancelReason) {
+    lines.push(`Reden annulering: ${state.cancelReason}`);
+  }
+
+  return lines.join("\n");
+}
+
+async function upsertAdminControlPanel(ticketChannel) {
+  const state = ticketState.get(ticketChannel.id);
+  if (!state?.adminUserId) return;
+
+  const meta = parseTicketTopic(ticketChannel.topic);
+  if (!meta) return;
+
+  const dm = await getAdminDmChannel(state.adminUserId);
+  if (!dm) return;
+
+  const content = buildAdminStatusText(ticketChannel, state, meta);
+  const components = buildAdminControlRows(ticketChannel.id, state);
+
+  let msg = null;
+  if (state.adminControlMessageId) {
+    msg = await dm.messages.fetch(state.adminControlMessageId).catch(() => null);
+  }
+
+  if (msg) {
+    await msg.edit({ content, components }).catch(() => {});
+    return;
+  }
+
+  const sent = await dm.send({ content, components }).catch(() => null);
+  if (!sent) return;
+
+  ticketState.set(ticketChannel.id, {
+    ...state,
+    adminDmChannelId: dm.id,
+    adminControlMessageId: sent.id,
+  });
+}
+
+async function deleteAdminDetailMessage(ticketChannelId) {
+  const state = ticketState.get(ticketChannelId);
+  if (!state?.adminDmChannelId || !state?.missingDataAdminMessageId) return;
+
+  const userDm = await client.channels.fetch(state.adminDmChannelId).catch(() => null);
+  if (!userDm) return;
+
+  const msg = await userDm.messages.fetch(state.missingDataAdminMessageId).catch(() => null);
+  if (msg) await msg.delete().catch(() => {});
+}
+
+async function deleteMemberMissingNotice(ticketChannel) {
+  const state = ticketState.get(ticketChannel.id);
+  if (!state?.missingDataTicketNoticeMessageId) return;
+
+  const msg = await ticketChannel.messages.fetch(state.missingDataTicketNoticeMessageId).catch(() => null);
+  if (msg) await msg.delete().catch(() => {});
+}
+
+async function clearMissingDataMessages(ticketChannel) {
+  await deleteAdminDetailMessage(ticketChannel.id);
+  await deleteMemberMissingNotice(ticketChannel);
+
+  const state = ticketState.get(ticketChannel.id) || {};
+  ticketState.set(ticketChannel.id, {
+    ...state,
+    missingFields: undefined,
+    missingValues: undefined,
+    missingDataAdminMessageId: undefined,
+    missingDataTicketNoticeMessageId: undefined,
+  });
 }
 
 client.once(Events.ClientReady, (c) => {
@@ -553,7 +534,7 @@ client.once(Events.ClientReady, (c) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     // -------------------------
-    // Slash commands
+    // SLASH COMMANDS
     // -------------------------
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "ping") {
@@ -566,6 +547,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await replyTemp(interaction, "❌ Je hebt geen rechten voor dit commando (Manage Channels nodig).");
           return;
         }
+
         if (!TICKETS_CATEGORY_ID) {
           await replyTemp(interaction, "❌ TICKETS_CATEGORY_ID staat nog niet in .env");
           return;
@@ -618,6 +600,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           ],
         });
 
+        ticketState.set(ticketChannel.id, {
+          approved: false,
+          adminUserId: interaction.user.id,
+        });
+
         const bericht = [
           `Beste ${lid},`,
           ``,
@@ -633,134 +620,37 @@ client.on(Events.InteractionCreate, async (interaction) => {
           components: [memberInitialRow()],
         });
 
-        const adminWorkspace = await createAdminWorkspaceForTicket(ticketChannel, interaction.user.id);
+        await upsertAdminControlPanel(ticketChannel);
 
-        ticketState.set(ticketChannel.id, {
-          approved: false,
-          adminSpaceId: adminWorkspace.channel.id,
-          adminSpaceType: adminWorkspace.type,
-        });
-
-        adminSpaceToTicket.set(adminWorkspace.channel.id, ticketChannel.id);
-
-        await adminWorkspace.channel.send({
-          content: `🔐 **Admin acties voor ticket:** ${ticketChannel}`,
-          components: [adminInitialRow()],
-        });
-
-        await replyTemp(interaction, `✅ Ticket aangemaakt: ${ticketChannel}`);
+        await replyTemp(interaction, `✅ Ticket aangemaakt: ${ticketChannel}\n🔐 Adminbediening is naar je DM gestuurd.`);
         return;
       }
     }
 
     // -------------------------
-    // Buttons
+    // TICKET BUTTONS (in kanaal)
     // -------------------------
     if (interaction.isButton()) {
-      const ctx = await resolveTicketContext(interaction);
-      if (!ctx) {
-        await replyTemp(interaction, "❌ Dit werkt alleen in een ticketkanaal.");
-        return;
-      }
-
-      const { ticketChannel, currentChannel, inAdminWorkspace, meta } = ctx;
-      const aanvragerId = meta.userId;
-      const euro = meta.euro;
-      const punten = meta.punten;
-
-      if (interaction.customId === "ticket_accept") {
-        if (!isAdmin(interaction)) {
-          await replyTemp(interaction, "❌ Alleen admin kan accepteren.");
-          return;
-        }
-
-        if (!inAdminWorkspace) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
-          return;
-        }
-
-        const state = ticketState.get(ticketChannel.id) || {};
-        ticketState.set(ticketChannel.id, { ...state, approved: true });
-
-        const user = await client.users.fetch(aanvragerId).catch(() => null);
-        if (user) {
-          const displayName = await getMemberDisplayName(interaction.guild, aanvragerId);
-          const ticketLink = `https://discord.com/channels/${ticketChannel.guildId}/${ticketChannel.id}`;
-          await user
-            .send(
-              [
-                `Beste ${displayName},`,
-                ``,
-                `We hebben je aanvraag in behandeling genomen. Via het geopende ticket kan je de voortgang volgen.`,
-                `Het kan enige tijd duren voor je ticket helemaal is afgehandeld.`,
-                ``,
-                `Klik hier om direct naar jouw ticket te gaan: ${ticketLink}`,
-                ``,
-                `Fijne dag,`,
-                `Team StreApp`,
-              ].join("\n")
-            )
-            .catch(() => {});
-        }
-
-        const naam = `<@${aanvragerId}>`;
-        const tekst = [
-          `✅ **Aanvraag goedgekeurd**`,
-          ``,
-          `Beste ${naam}, je aanvraag om **${punten} Sebbie** om te wisselen voor **€${euro} cash** is goedgekeurd.`,
-          ``,
-          `**Wat gaat er nu gebeuren?**`,
-          `Wij gaan jouw aanvraag zo snel mogelijk verwerken in onze administratie en vervolgens storten wij het geclaimde bedrag op je rekening.`,
-          ``,
-          `Zodra wij de betaling hebben uitgevoerd wordt het ticket gesloten.`,
-          ``,
-          `Fijne dag!`,
-          `**Team StreApp**`,
-        ].join("\n");
-
-        await ticketChannel.send(tekst);
-        await disableMemberCancelButtonInChannel(ticketChannel);
-
-        await currentChannel.send({
-          content: `🔐 **Admin acties** (na acceptatie):`,
-          components: [adminAfterAcceptRow()],
-        });
-
-        await replyTemp(interaction, "✅ Goedgekeurd + admin knoppen geplaatst.");
-        return;
-      }
-
-      if (interaction.customId === "ticket_reject") {
-        if (!isAdmin(interaction)) {
-          await replyTemp(interaction, "❌ Alleen admin kan afkeuren.");
-          return;
-        }
-
-        if (!inAdminWorkspace) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
-          return;
-        }
-
-        const modal = new ModalBuilder().setCustomId("modal_reject_reason").setTitle("Aanvraag afkeuren (reden verplicht)");
-        const reasonInput = new TextInputBuilder()
-          .setCustomId("reject_reason")
-          .setLabel("Reden (wordt naar het lid gestuurd)")
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(true)
-          .setMaxLength(1000);
-
-        modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
-        await interaction.showModal(modal);
-        return;
-      }
+      const channel = interaction.channel;
 
       if (interaction.customId === "ticket_cancel") {
-        if (interaction.user.id !== aanvragerId) {
+        if (!channel || channel.type !== ChannelType.GuildText) {
+          await replyTemp(interaction, "❌ Dit werkt alleen in een ticketkanaal.");
+          return;
+        }
+
+        const meta = parseTicketTopic(channel.topic);
+        if (!meta) {
+          await replyTemp(interaction, "❌ Dit kanaal lijkt geen Sebbie-ticket te zijn.");
+          return;
+        }
+
+        if (interaction.user.id !== meta.userId) {
           await replyTemp(interaction, "❌ Alleen de aanvrager kan annuleren.");
           return;
         }
 
-        const state = ticketState.get(ticketChannel.id) || {};
+        const state = ticketState.get(channel.id) || {};
         if (state.approved) {
           await replyTemp(interaction, "❌ Annuleren is niet meer mogelijk nadat de aanvraag is geaccepteerd.");
           return;
@@ -779,198 +669,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      if (interaction.customId === "admin_close_cancel") {
-        if (!isAdmin(interaction)) {
-          await replyTemp(interaction, "❌ Alleen admin kan dit doen.");
-          return;
-        }
-
-        if (!inAdminWorkspace) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
-          return;
-        }
-
-        const state = ticketState.get(ticketChannel.id) || {};
-        const reason = state.cancelReason || "Geen reden opgegeven.";
-
-        const user = await client.users.fetch(aanvragerId).catch(() => null);
-        if (user) {
-          const displayName = await getMemberDisplayName(interaction.guild, aanvragerId);
-          await user
-            .send(
-              [
-                `Beste ${displayName},`,
-                ``,
-                `Je hebt je aanvraag om **${punten} Sebbie** te wisselen voor **€${euro} cash** geannuleerd.`,
-                `Je gaf hierbij op als reden: ${reason}`,
-                ``,
-                `Je ticket is afgesloten.`,
-                `Fijne dag.`,
-                `Team StreApp`,
-              ].join("\n")
-            )
-            .catch(() => {});
-        }
-
-        await logToChannel(
-          interaction.guild,
-          [
-            `🟡 **Ticket geannuleerd (door lid, afgesloten door admin)**`,
-            `Lid: <@${aanvragerId}>`,
-            `Ingewisseld: ${punten} Sebbie (aanvraag)`,
-            `Bedrag: €${euro}`,
-            `Reden: ${reason}`,
-            `Tijdstip: ${nowNl()}`,
-            `Admin: <@${interaction.user.id}>`,
-            `Kanaal: #${ticketChannel.name}`,
-          ].join("\n")
-        );
-
-        await replyTemp(interaction, "✅ Ticket wordt afgesloten.");
-
-        await deleteAdminWorkspaceForTicket(ticketChannel);
-        ticketState.delete(ticketChannel.id);
-
-        await ticketChannel.delete("Sebbie voor Cash: geannuleerd").catch(() => {});
-        return;
-      }
-
-      if (interaction.customId === "ticket_paid") {
-        if (!isAdmin(interaction)) {
-          await replyTemp(interaction, "❌ Alleen admin kan dit doen.");
-          return;
-        }
-
-        if (!inAdminWorkspace) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
-          return;
-        }
-
-        const state = ticketState.get(ticketChannel.id) || {};
-        if (!state.approved) {
-          await replyTemp(interaction, "❌ Je kunt pas op Betaald klikken nadat je de aanvraag hebt geaccepteerd.");
-          return;
-        }
-
-        const modal = new ModalBuilder().setCustomId("modal_paid_agreement").setTitle("Betaling afronden");
-        const koInput = new TextInputBuilder()
-          .setCustomId("agreement_no")
-          .setLabel("Koopovereenkomst nummer (verplicht)")
-          .setPlaceholder("Bijv: K20260401")
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true)
-          .setMaxLength(30);
-
-        modal.addComponents(new ActionRowBuilder().addComponents(koInput));
-        await interaction.showModal(modal);
-        return;
-      }
-
-      if (interaction.customId === "ticket_missing_data") {
-        if (!isAdmin(interaction)) {
-          await replyTemp(interaction, "❌ Alleen admin kan dit doen.");
-          return;
-        }
-
-        if (!inAdminWorkspace) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
-          return;
-        }
-
-        const state = ticketState.get(ticketChannel.id) || {};
-        if (!state.approved) {
-          await replyTemp(interaction, "❌ Gebruik Ontbrekende gegevens pas nadat je de aanvraag hebt geaccepteerd.");
-          return;
-        }
-
-        await interaction
-          .reply({
-            content: `📋 Selecteer hieronder welke gegevens ontbreken:`,
-            components: [missingFieldsSelectRow()],
-            flags: MessageFlags.Ephemeral,
-          })
-          .catch(() => {});
-        setTimeout(() => interaction.deleteReply().catch(() => {}), 8000);
-        return;
-      }
-
-      if (interaction.customId.startsWith("copy_val_")) {
-        if (!isAdmin(interaction)) {
-          await replyTemp(interaction, "❌ Alleen admin kan dit doen.");
-          return;
-        }
-
-        if (!inAdminWorkspace) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
-          return;
-        }
-
-        const state = ticketState.get(ticketChannel.id) || {};
-        const values = state.missingValues;
-        if (!values) {
-          await replyTemp(interaction, "❌ Geen gegevens om te kopiëren (nog niet ingevuld of al gewist).");
-          return;
-        }
-
-        const key = interaction.customId.replace("copy_val_", "");
-        const value = (values[key] || "").toString().trim();
-
-        if (!value) {
-          await replyTemp(interaction, "❌ Dit veld heeft geen waarde.");
-          return;
-        }
-
-        const safe = safeForCodeBlock(value);
-        await replyTemp(interaction, `\`\`\`\n${safe}\n\`\`\``, 15000);
-        return;
-      }
-
-      if (interaction.customId === "admin_wipe_missing_data") {
-        if (!isAdmin(interaction)) {
-          await replyTemp(interaction, "❌ Alleen admin kan dit doen.");
-          return;
-        }
-
-        if (!inAdminWorkspace) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
-          return;
-        }
-
-        const state = ticketState.get(ticketChannel.id) || {};
-        const msgId = state.missingDataMessageId;
-
-        if (msgId) {
-          const adminSpace = await getAdminWorkspaceForTicket(ticketChannel);
-          if (adminSpace && adminSpace.messages) {
-            const msg = await adminSpace.messages.fetch(msgId).catch(() => null);
-            if (msg) await msg.delete().catch(() => {});
-          }
-        }
-
-        ticketState.set(ticketChannel.id, {
-          ...state,
-          missingFields: undefined,
-          missingDataMessageId: undefined,
-          missingValues: undefined,
-        });
-
-        await replyTemp(interaction, "🗑 Aanvullende gegevens zijn gewist uit dit ticket.");
-        await sendTemp(ticketChannel, "🗑 **Aanvullende gegevens zijn door admin gewist (privacy).**", 10000).catch(() => {});
-        return;
-      }
-
       if (interaction.customId === "member_fill_missing_data") {
-        if (interaction.channel.type !== ChannelType.GuildText) {
+        if (!channel || channel.type !== ChannelType.GuildText) {
           await replyTemp(interaction, "❌ Dit werkt alleen in het hoofd-ticket.");
           return;
         }
 
-        if (interaction.user.id !== aanvragerId) {
+        const meta = parseTicketTopic(channel.topic);
+        if (!meta) {
+          await replyTemp(interaction, "❌ Dit kanaal lijkt geen Sebbie-ticket te zijn.");
+          return;
+        }
+
+        if (interaction.user.id !== meta.userId) {
           await replyTemp(interaction, "❌ Alleen de aanvrager kan dit invullen.");
           return;
         }
 
-        const state = ticketState.get(ticketChannel.id) || {};
+        const state = ticketState.get(channel.id) || {};
         const fields = state.missingFields || [];
         if (!fields.length) {
           await replyTemp(interaction, "❌ Er zijn geen ontbrekende velden aangevraagd.");
@@ -978,142 +694,372 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const modal = new ModalBuilder().setCustomId("modal_member_missing_data").setTitle("Aanvullende gegevens invullen");
-
         const components = [];
 
         if (fields.includes("firstName")) {
-          const input = new TextInputBuilder()
-            .setCustomId("firstName")
-            .setLabel("Voornaam")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setMaxLength(80);
-          components.push(new ActionRowBuilder().addComponents(input));
+          components.push(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder()
+                .setCustomId("firstName")
+                .setLabel("Voornaam")
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true)
+                .setMaxLength(80)
+            )
+          );
         }
 
         if (fields.includes("lastName")) {
-          const input = new TextInputBuilder()
-            .setCustomId("lastName")
-            .setLabel("Achternaam")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setMaxLength(120);
-          components.push(new ActionRowBuilder().addComponents(input));
+          components.push(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder()
+                .setCustomId("lastName")
+                .setLabel("Achternaam")
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true)
+                .setMaxLength(120)
+            )
+          );
         }
 
         if (fields.includes("city")) {
-          const input = new TextInputBuilder()
-            .setCustomId("city")
-            .setLabel("Woonplaats (alleen plaatsnaam)")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setMaxLength(120);
-          components.push(new ActionRowBuilder().addComponents(input));
+          components.push(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder()
+                .setCustomId("city")
+                .setLabel("Woonplaats (alleen plaatsnaam)")
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true)
+                .setMaxLength(120)
+            )
+          );
         }
 
         if (fields.includes("iban")) {
-          const input = new TextInputBuilder()
-            .setCustomId("iban")
-            .setLabel("Rekeningnummer (IBAN)")
-            .setPlaceholder("Bijv: NL00BANK0123456789")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setMaxLength(34);
-          components.push(new ActionRowBuilder().addComponents(input));
+          components.push(
+            new ActionRowBuilder().addComponents(
+              new TextInputBuilder()
+                .setCustomId("iban")
+                .setLabel("Rekeningnummer (IBAN)")
+                .setPlaceholder("Bijv: NL00BANK0123456789")
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true)
+                .setMaxLength(34)
+            )
+          );
         }
 
         modal.addComponents(...components);
         await interaction.showModal(modal);
         return;
       }
+
+      // -------------------------
+      // ADMIN BUTTONS (via DM)
+      // -------------------------
+      const ticketAcceptId = extractTicketId(interaction.customId, "ticket_accept");
+      const ticketRejectId = extractTicketId(interaction.customId, "ticket_reject");
+      const ticketPaidId = extractTicketId(interaction.customId, "ticket_paid");
+      const ticketMissingDataId = extractTicketId(interaction.customId, "ticket_missing_data");
+      const adminCloseCancelId = extractTicketId(interaction.customId, "admin_close_cancel");
+      const adminWipeId = extractTicketId(interaction.customId, "admin_wipe_missing_data");
+
+      const copyKeys = ["firstName", "lastName", "city", "iban"];
+      let copyField = null;
+      let copyTicketId = null;
+      for (const key of copyKeys) {
+        const maybeId = extractTicketId(interaction.customId, `copy_val_${key}`);
+        if (maybeId) {
+          copyField = key;
+          copyTicketId = maybeId;
+          break;
+        }
+      }
+
+      const adminTicketId =
+        ticketAcceptId ||
+        ticketRejectId ||
+        ticketPaidId ||
+        ticketMissingDataId ||
+        adminCloseCancelId ||
+        adminWipeId ||
+        copyTicketId;
+
+      if (adminTicketId) {
+        const ticketChannel = await getTicketChannelById(adminTicketId);
+        if (!ticketChannel || ticketChannel.type !== ChannelType.GuildText) {
+          await replyTemp(interaction, "❌ Ticket niet gevonden.");
+          return;
+        }
+
+        const state = ticketState.get(ticketChannel.id) || {};
+        if (interaction.user.id !== state.adminUserId) {
+          await replyTemp(interaction, "❌ Alleen de ticketadmin kan deze DM-bediening gebruiken.");
+          return;
+        }
+
+        const meta = parseTicketTopic(ticketChannel.topic);
+        if (!meta) {
+          await replyTemp(interaction, "❌ Ticketgegevens ongeldig.");
+          return;
+        }
+
+        const aanvragerId = meta.userId;
+        const euro = meta.euro;
+        const punten = meta.punten;
+
+        if (ticketAcceptId) {
+          ticketState.set(ticketChannel.id, { ...state, approved: true });
+
+          const user = await client.users.fetch(aanvragerId).catch(() => null);
+          if (user) {
+            const displayName = await getMemberDisplayName(ticketChannel.guild, aanvragerId);
+            const ticketLink = `https://discord.com/channels/${ticketChannel.guildId}/${ticketChannel.id}`;
+            await user
+              .send(
+                [
+                  `Beste ${displayName},`,
+                  ``,
+                  `We hebben je aanvraag in behandeling genomen. Via het geopende ticket kan je de voortgang volgen.`,
+                  `Het kan enige tijd duren voor je ticket helemaal is afgehandeld.`,
+                  ``,
+                  `Klik hier om direct naar jouw ticket te gaan: ${ticketLink}`,
+                  ``,
+                  `Fijne dag,`,
+                  `Team StreApp`,
+                ].join("\n")
+              )
+              .catch(() => {});
+          }
+
+          const naam = `<@${aanvragerId}>`;
+          const tekst = [
+            `✅ **Aanvraag goedgekeurd**`,
+            ``,
+            `Beste ${naam}, je aanvraag om **${punten} Sebbie** om te wisselen voor **€${euro} cash** is goedgekeurd.`,
+            ``,
+            `**Wat gaat er nu gebeuren?**`,
+            `Wij gaan jouw aanvraag zo snel mogelijk verwerken in onze administratie en vervolgens storten wij het geclaimde bedrag op je rekening.`,
+            ``,
+            `Zodra wij de betaling hebben uitgevoerd wordt het ticket gesloten.`,
+            ``,
+            `Fijne dag!`,
+            `**Team StreApp**`,
+          ].join("\n");
+
+          await ticketChannel.send(tekst);
+          await disableMemberCancelButtonInChannel(ticketChannel);
+          await upsertAdminControlPanel(ticketChannel);
+          await replyTemp(interaction, "✅ Aanvraag goedgekeurd.");
+          return;
+        }
+
+        if (ticketRejectId) {
+          const modal = new ModalBuilder()
+            .setCustomId(`modal_reject_reason:${ticketChannel.id}`)
+            .setTitle("Aanvraag afkeuren (reden verplicht)");
+
+          const reasonInput = new TextInputBuilder()
+            .setCustomId("reject_reason")
+            .setLabel("Reden (wordt naar het lid gestuurd)")
+            .setStyle(TextInputStyle.Paragraph)
+            .setRequired(true)
+            .setMaxLength(1000);
+
+          modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+          await interaction.showModal(modal);
+          return;
+        }
+
+        if (adminCloseCancelId) {
+          const reason = state.cancelReason || "Geen reden opgegeven.";
+
+          const user = await client.users.fetch(aanvragerId).catch(() => null);
+          if (user) {
+            const displayName = await getMemberDisplayName(ticketChannel.guild, aanvragerId);
+            await user
+              .send(
+                [
+                  `Beste ${displayName},`,
+                  ``,
+                  `Je hebt je aanvraag om **${punten} Sebbie** te wisselen voor **€${euro} cash** geannuleerd.`,
+                  `Je gaf hierbij op als reden: ${reason}`,
+                  ``,
+                  `Je ticket is afgesloten.`,
+                  `Fijne dag.`,
+                  `Team StreApp`,
+                ].join("\n")
+              )
+              .catch(() => {});
+          }
+
+          await logToChannel(
+            ticketChannel.guild,
+            [
+              `🟡 **Ticket geannuleerd (door lid, afgesloten door admin)**`,
+              `Lid: <@${aanvragerId}>`,
+              `Ingewisseld: ${punten} Sebbie (aanvraag)`,
+              `Bedrag: €${euro}`,
+              `Reden: ${reason}`,
+              `Tijdstip: ${nowNl()}`,
+              `Admin: <@${interaction.user.id}>`,
+              `Kanaal: #${ticketChannel.name}`,
+            ].join("\n")
+          );
+
+          await clearMissingDataMessages(ticketChannel);
+          ticketState.delete(ticketChannel.id);
+          await replyTemp(interaction, "✅ Ticket wordt afgesloten.");
+          await ticketChannel.delete("Sebbie voor Cash: geannuleerd").catch(() => {});
+          return;
+        }
+
+        if (ticketPaidId) {
+          if (!state.approved) {
+            await replyTemp(interaction, "❌ Je kunt pas op Betaald klikken nadat je de aanvraag hebt geaccepteerd.");
+            return;
+          }
+
+          const modal = new ModalBuilder()
+            .setCustomId(`modal_paid_agreement:${ticketChannel.id}`)
+            .setTitle("Betaling afronden");
+
+          const koInput = new TextInputBuilder()
+            .setCustomId("agreement_no")
+            .setLabel("Koopovereenkomst nummer (verplicht)")
+            .setPlaceholder("Bijv: K20260401")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(30);
+
+          modal.addComponents(new ActionRowBuilder().addComponents(koInput));
+          await interaction.showModal(modal);
+          return;
+        }
+
+        if (ticketMissingDataId) {
+          if (!state.approved) {
+            await replyTemp(interaction, "❌ Gebruik Ontbrekende gegevens pas nadat je de aanvraag hebt geaccepteerd.");
+            return;
+          }
+
+          await interaction.reply({
+            content: `📋 Selecteer hieronder welke gegevens ontbreken:`,
+            components: [missingFieldsSelectRow(ticketChannel.id)],
+            flags: MessageFlags.Ephemeral,
+          }).catch(() => {});
+
+          setTimeout(() => interaction.deleteReply().catch(() => {}), 8000);
+          return;
+        }
+
+        if (copyTicketId && copyField) {
+          const values = state.missingValues;
+          if (!values) {
+            await replyTemp(interaction, "❌ Geen gegevens om te kopiëren (nog niet ingevuld of al gewist).");
+            return;
+          }
+
+          const value = (values[copyField] || "").toString().trim();
+          if (!value) {
+            await replyTemp(interaction, "❌ Dit veld heeft geen waarde.");
+            return;
+          }
+
+          await replyTemp(interaction, `\`\`\`\n${safeForCodeBlock(value)}\n\`\`\``, 15000);
+          return;
+        }
+
+        if (adminWipeId) {
+          await clearMissingDataMessages(ticketChannel);
+
+          await replyTemp(interaction, "🗑 Aanvullende gegevens zijn gewist.");
+          await sendTemp(ticketChannel, "🗑 **Aanvullende gegevens zijn door admin gewist (privacy).**", 10000).catch(() => {});
+          await upsertAdminControlPanel(ticketChannel);
+          return;
+        }
+      }
     }
 
     // -------------------------
-    // Select menu
+    // SELECT MENU (admin via DM)
     // -------------------------
     if (interaction.isStringSelectMenu()) {
-      const ctx = await resolveTicketContext(interaction);
-      if (!ctx) {
-        await replyTemp(interaction, "❌ Dit werkt alleen in een ticketkanaal.");
+      const ticketChannelId = extractTicketId(interaction.customId, "select_missing_fields");
+      if (!ticketChannelId) return;
+
+      const ticketChannel = await getTicketChannelById(ticketChannelId);
+      if (!ticketChannel || ticketChannel.type !== ChannelType.GuildText) {
+        await replyTemp(interaction, "❌ Ticket niet gevonden.");
         return;
       }
 
-      const { ticketChannel, inAdminWorkspace } = ctx;
-
-      if (interaction.customId === "select_missing_fields") {
-        if (!isAdmin(interaction)) {
-          await replyTemp(interaction, "❌ Alleen admin kan dit doen.");
-          return;
-        }
-
-        if (!inAdminWorkspace) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
-          return;
-        }
-
-        const selected = interaction.values;
-        const state = ticketState.get(ticketChannel.id) || {};
-        ticketState.set(ticketChannel.id, { ...state, missingFields: selected });
-
-        const human = fieldsToHumanList(selected);
-
-        const requestText = [
-          `📋 **Aanvullende gegevens vereist**`,
-          ``,
-          `Wij hebben aanvullende gegevens nodig om het door jou geclaimde bedrag op je rekening te storten.`,
-          `We missen: **${human.join(", ")}**`,
-          ``,
-          `Klik op **"Gegevens invullen"** om de gevraagde gegevens aan te leveren.`,
-          ``,
-          `⚠️ Zorg dat je de ingevoerde gegevens goed controleert om vertraging te voorkomen en om te zorgen dat we het bedrag aan de juiste persoon overmaken.`,
-        ].join("\n");
-
-        await ticketChannel.send({ content: requestText, components: [buildMemberFillRowActive()] });
-        await replyTemp(interaction, "✅ Verzoek geplaatst in het ticket.");
+      const state = ticketState.get(ticketChannel.id) || {};
+      if (interaction.user.id !== state.adminUserId) {
+        await replyTemp(interaction, "❌ Alleen de ticketadmin kan dit doen.");
         return;
       }
+
+      const selected = interaction.values;
+      ticketState.set(ticketChannel.id, { ...state, missingFields: selected });
+
+      const human = fieldsToHumanList(selected);
+
+      const requestText = [
+        `📋 **Aanvullende gegevens vereist**`,
+        ``,
+        `Wij hebben aanvullende gegevens nodig om het door jou geclaimde bedrag op je rekening te storten.`,
+        `We missen: **${human.join(", ")}**`,
+        ``,
+        `Klik op **"Gegevens invullen"** om de gevraagde gegevens aan te leveren.`,
+        ``,
+        `⚠️ Zorg dat je de ingevoerde gegevens goed controleert om vertraging te voorkomen en om te zorgen dat we het bedrag aan de juiste persoon overmaken.`,
+      ].join("\n");
+
+      await ticketChannel.send({ content: requestText, components: [buildMemberFillRowActive()] });
+      await replyTemp(interaction, "✅ Verzoek geplaatst in het ticket.");
+      return;
     }
 
     // -------------------------
-    // Modals
+    // MODALS
     // -------------------------
     if (interaction.isModalSubmit()) {
-      const ctx = await resolveTicketContext(interaction);
-      if (!ctx) {
-        await replyTemp(interaction, "❌ Dit werkt alleen in een ticketkanaal.");
-        return;
-      }
-
-      const { ticketChannel, inAdminWorkspace, meta } = ctx;
-      const aanvragerId = meta.userId;
-      const euro = meta.euro;
-      const punten = meta.punten;
-
-      if (interaction.customId === "modal_reject_reason") {
-        if (!isAdmin(interaction)) {
-          await replyTemp(interaction, "❌ Alleen admin kan afkeuren.");
+      // Afkeuren via admin DM
+      const rejectTicketId = extractTicketId(interaction.customId, "modal_reject_reason");
+      if (rejectTicketId) {
+        const ticketChannel = await getTicketChannelById(rejectTicketId);
+        if (!ticketChannel || ticketChannel.type !== ChannelType.GuildText) {
+          await replyTemp(interaction, "❌ Ticket niet gevonden.");
           return;
         }
 
-        if (!inAdminWorkspace) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
+        const state = ticketState.get(ticketChannel.id) || {};
+        if (interaction.user.id !== state.adminUserId) {
+          await replyTemp(interaction, "❌ Alleen de ticketadmin kan dit doen.");
+          return;
+        }
+
+        const meta = parseTicketTopic(ticketChannel.topic);
+        if (!meta) {
+          await replyTemp(interaction, "❌ Ticketgegevens ongeldig.");
           return;
         }
 
         const reason = interaction.fields.getTextInputValue("reject_reason");
-        ticketState.set(ticketChannel.id, { ...(ticketState.get(ticketChannel.id) || {}), rejectReason: reason });
+        ticketState.set(ticketChannel.id, { ...state, rejectReason: reason });
 
         await ticketChannel.send([`❌ **Aanvraag afgekeurd**`, `Reden: ${reason}`].join("\n"));
 
-        const user = await client.users.fetch(aanvragerId).catch(() => null);
+        const user = await client.users.fetch(meta.userId).catch(() => null);
         if (user) {
-          const displayName = await getMemberDisplayName(interaction.guild, aanvragerId);
+          const displayName = await getMemberDisplayName(ticketChannel.guild, meta.userId);
           await user
             .send(
               [
                 `Beste ${displayName},`,
                 ``,
-                `Je aanvraag om **${punten} Sebbie** om te wisselen voor **€${euro} cash** is **afgekeurd**.`,
+                `Je aanvraag om **${meta.punten} Sebbie** om te wisselen voor **€${meta.euro} cash** is **afgekeurd**.`,
                 `Reden: ${reason}`,
                 ``,
                 `Fijne dag,`,
@@ -1124,12 +1070,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         await logToChannel(
-          interaction.guild,
+          ticketChannel.guild,
           [
             `🔴 **Ticket afgekeurd (afgesloten door admin)**`,
-            `Lid: <@${aanvragerId}>`,
-            `Ingewisseld: ${punten} Sebbie (aanvraag)`,
-            `Bedrag: €${euro}`,
+            `Lid: <@${meta.userId}>`,
+            `Ingewisseld: ${meta.punten} Sebbie (aanvraag)`,
+            `Bedrag: €${meta.euro}`,
             `Reden afkeuring: ${reason}`,
             `Tijdstip: ${nowNl()}`,
             `Admin: <@${interaction.user.id}>`,
@@ -1137,60 +1083,37 @@ client.on(Events.InteractionCreate, async (interaction) => {
           ].join("\n")
         );
 
-        await replyTemp(interaction, "✅ Afkeuring verstuurd. Ticket wordt afgesloten.");
-
-        await deleteAdminWorkspaceForTicket(ticketChannel);
+        await clearMissingDataMessages(ticketChannel);
         ticketState.delete(ticketChannel.id);
 
+        await replyTemp(interaction, "✅ Afkeuring verstuurd. Ticket wordt afgesloten.");
         await ticketChannel.delete("Sebbie voor Cash: afgekeurd").catch(() => {});
         return;
       }
 
-      if (interaction.customId === "modal_cancel_reason") {
-        if (interaction.user.id !== aanvragerId) {
-          await replyTemp(interaction, "❌ Alleen de aanvrager kan annuleren.");
+      // Betaald via admin DM
+      const paidTicketId = extractTicketId(interaction.customId, "modal_paid_agreement");
+      if (paidTicketId) {
+        const ticketChannel = await getTicketChannelById(paidTicketId);
+        if (!ticketChannel || ticketChannel.type !== ChannelType.GuildText) {
+          await replyTemp(interaction, "❌ Ticket niet gevonden.");
           return;
         }
 
         const state = ticketState.get(ticketChannel.id) || {};
-        if (state.approved) {
-          await replyTemp(interaction, "❌ Annuleren is niet meer mogelijk nadat de aanvraag is geaccepteerd.");
+        if (interaction.user.id !== state.adminUserId) {
+          await replyTemp(interaction, "❌ Alleen de ticketadmin kan dit doen.");
           return;
         }
 
-        const reason = interaction.fields.getTextInputValue("cancel_reason");
-        ticketState.set(ticketChannel.id, { ...(ticketState.get(ticketChannel.id) || {}), cancelReason: reason });
-
-        await ticketChannel.send({
-          content: [`🟡 **Aanvraag geannuleerd door lid**`, `Reden: ${reason}`].join("\n"),
-        });
-
-        const adminSpace = await getAdminWorkspaceForTicket(ticketChannel);
-        if (adminSpace) {
-          await adminSpace.send({
-            content: `🟡 **Lid heeft aanvraag geannuleerd**\nReden: ${reason}`,
-            components: [adminCancelRow()],
-          });
-        }
-
-        await replyTemp(interaction, "✅ Annulering doorgegeven. Admin kan nu afsluiten.");
-        return;
-      }
-
-      if (interaction.customId === "modal_paid_agreement") {
-        if (!isAdmin(interaction)) {
-          await replyTemp(interaction, "❌ Alleen admin kan dit doen.");
-          return;
-        }
-
-        if (!inAdminWorkspace) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
-          return;
-        }
-
-        const state = ticketState.get(ticketChannel.id) || {};
         if (!state.approved) {
           await replyTemp(interaction, "❌ Je kunt pas afronden nadat je de aanvraag hebt geaccepteerd.");
+          return;
+        }
+
+        const meta = parseTicketTopic(ticketChannel.topic);
+        if (!meta) {
+          await replyTemp(interaction, "❌ Ticketgegevens ongeldig.");
           return;
         }
 
@@ -1200,16 +1123,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const user = await client.users.fetch(aanvragerId).catch(() => null);
+        const user = await client.users.fetch(meta.userId).catch(() => null);
         if (user) {
-          const displayName = await getMemberDisplayName(interaction.guild, aanvragerId);
+          const displayName = await getMemberDisplayName(ticketChannel.guild, meta.userId);
           await user
             .send(
               [
                 `Beste ${displayName},`,
                 ``,
                 `Wij hebben jouw aanvraag verwerkt.`,
-                `✅ Je hebt **${punten} Sebbie** ingewisseld voor **€${euro} cash**.`,
+                `✅ Je hebt **${meta.punten} Sebbie** ingewisseld voor **€${meta.euro} cash**.`,
                 `Koopovereenkomst: **${agreementNo}**`,
                 ``,
                 `Je ticket is afgesloten.`,
@@ -1221,12 +1144,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         await logToChannel(
-          interaction.guild,
+          ticketChannel.guild,
           [
             `💰 **Betaalde aanvraag**`,
-            `Lid: <@${aanvragerId}>`,
-            `Ingewisseld: ${punten} Sebbie`,
-            `Bedrag: €${euro}`,
+            `Lid: <@${meta.userId}>`,
+            `Ingewisseld: ${meta.punten} Sebbie`,
+            `Bedrag: €${meta.euro}`,
             `Koopovereenkomst: ${agreementNo}`,
             `Tijdstip: ${nowNl()}`,
             `Admin: <@${interaction.user.id}>`,
@@ -1234,27 +1157,72 @@ client.on(Events.InteractionCreate, async (interaction) => {
           ].join("\n")
         );
 
-        await replyTemp(interaction, "✅ Betaald geregistreerd. Ticket wordt gesloten.");
-
-        await deleteAdminWorkspaceForTicket(ticketChannel);
+        await clearMissingDataMessages(ticketChannel);
         ticketState.delete(ticketChannel.id);
 
+        await replyTemp(interaction, "✅ Betaald geregistreerd. Ticket wordt gesloten.");
         await ticketChannel.delete(`Sebbie voor Cash: betaald (${agreementNo})`).catch(() => {});
         return;
       }
 
+      // Annuleren door lid in ticket
+      if (interaction.customId === "modal_cancel_reason") {
+        const channel = interaction.channel;
+        if (!channel || channel.type !== ChannelType.GuildText) {
+          await replyTemp(interaction, "❌ Dit werkt alleen in een ticketkanaal.");
+          return;
+        }
+
+        const meta = parseTicketTopic(channel.topic);
+        if (!meta) {
+          await replyTemp(interaction, "❌ Dit kanaal lijkt geen Sebbie-ticket te zijn.");
+          return;
+        }
+
+        if (interaction.user.id !== meta.userId) {
+          await replyTemp(interaction, "❌ Alleen de aanvrager kan annuleren.");
+          return;
+        }
+
+        const state = ticketState.get(channel.id) || {};
+        if (state.approved) {
+          await replyTemp(interaction, "❌ Annuleren is niet meer mogelijk nadat de aanvraag is geaccepteerd.");
+          return;
+        }
+
+        const reason = interaction.fields.getTextInputValue("cancel_reason");
+        ticketState.set(channel.id, { ...state, cancelReason: reason });
+
+        await channel.send({
+          content: [`🟡 **Aanvraag geannuleerd door lid**`, `Reden: ${reason}`].join("\n"),
+        });
+
+        await upsertAdminControlPanel(channel);
+
+        await replyTemp(interaction, "✅ Annulering doorgegeven. Admin kan nu afsluiten.");
+        return;
+      }
+
+      // Aanvullende gegevens door lid in ticket
       if (interaction.customId === "modal_member_missing_data") {
-        if (interaction.channel.type !== ChannelType.GuildText) {
+        const channel = interaction.channel;
+        if (!channel || channel.type !== ChannelType.GuildText) {
           await replyTemp(interaction, "❌ Alleen de aanvrager kan dit in het hoofd-ticket invullen.");
           return;
         }
 
-        if (interaction.user.id !== aanvragerId) {
+        const meta = parseTicketTopic(channel.topic);
+        if (!meta) {
+          await replyTemp(interaction, "❌ Dit kanaal lijkt geen Sebbie-ticket te zijn.");
+          return;
+        }
+
+        if (interaction.user.id !== meta.userId) {
           await replyTemp(interaction, "❌ Alleen de aanvrager kan dit invullen.");
           return;
         }
 
-        const state = ticketState.get(ticketChannel.id) || {};
+        const state = ticketState.get(channel.id) || {};
         const fields = state.missingFields || [];
         if (!fields.length) {
           await replyTemp(interaction, "❌ Er zijn geen ontbrekende velden aangevraagd.");
@@ -1267,19 +1235,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (fields.includes("city")) values.city = interaction.fields.getTextInputValue("city")?.trim();
         if (fields.includes("iban")) values.iban = interaction.fields.getTextInputValue("iban")?.trim();
 
-        const human = fieldsToHumanList(fields);
+        await deleteMemberMissingNotice(channel);
 
-        await ticketChannel.send([
+        const ticketNotice = await channel.send([
           `📨 **Aanvullende gegevens ontvangen**`,
-          `Gevraagd: **${human.join(", ")}**`,
           ``,
           `✅ Dankjewel! We gaan hiermee verder in de administratie.`,
         ].join("\n"));
 
-        const adminSpace = await getAdminWorkspaceForTicket(ticketChannel);
-        if (adminSpace) {
+        await disableMemberFillButtonInChannel(channel);
+
+        const dm = await getAdminDmChannel(state.adminUserId);
+        let adminDetailMessageId;
+
+        if (dm) {
+          const human = fieldsToHumanList(fields);
           const lines = [
-            `📨 **Aanvullende gegevens ontvangen (alleen voor admin zichtbaar)**`,
+            `📨 **Aanvullende gegevens ontvangen**`,
+            `Ticket: ${channel}`,
             `Gevraagd: **${human.join(", ")}**`,
             ``,
             ...(values.firstName ? [`**Voornaam:** ${values.firstName}`] : []),
@@ -1290,26 +1263,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
             `⚠️ Wis deze gegevens zodra ze zijn overgenomen (privacy).`,
           ].join("\n");
 
-          const copyRow = buildCopyButtonsRow(values);
           const components = [];
+          const copyRow = buildCopyButtonsRow(channel.id, values);
           if (copyRow) components.push(copyRow);
-          components.push(adminWipeDataRow());
+          components.push(adminWipeDataRow(channel.id));
 
-          const msg = await adminSpace.send({ content: lines, components });
-
-          ticketState.set(ticketChannel.id, {
-            ...state,
-            missingDataMessageId: msg.id,
-            missingValues: values,
-          });
-        } else {
-          ticketState.set(ticketChannel.id, {
-            ...state,
-            missingValues: values,
-          });
+          const dmMsg = await dm.send({ content: lines, components }).catch(() => null);
+          if (dmMsg) adminDetailMessageId = dmMsg.id;
         }
 
-        await disableMemberFillButtonInChannel(ticketChannel);
+        ticketState.set(channel.id, {
+          ...state,
+          missingValues: values,
+          missingDataAdminMessageId: adminDetailMessageId,
+          missingDataTicketNoticeMessageId: ticketNotice.id,
+        });
 
         await replyTemp(interaction, "✅ Je gegevens zijn opgeslagen in het ticket.");
         return;
