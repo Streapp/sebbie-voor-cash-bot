@@ -35,8 +35,6 @@ const client = new Client({
 // -------------------------
 // ✅ PERSISTENTE AUDIT LOG (Render Disk) - per dag bestand
 // -------------------------
-// Op Render mounten we een disk op /var/data.
-// Lokaal bestaat dat pad niet, daarom gebruiken we lokaal ./data als fallback.
 const AUDIT_DIR =
   process.env.AUDIT_DIR ||
   (fs.existsSync("/var/data") ? "/var/data" : path.join(__dirname, "..", "data"));
@@ -53,7 +51,6 @@ function nowNl() {
   });
 }
 
-// Bestandsdatum voor NL-tijdzone (YYYY-MM-DD) -> audit-YYYY-MM-DD.log
 function dateKeyNl() {
   const parts = new Intl.DateTimeFormat("nl-NL", {
     timeZone: "Europe/Amsterdam",
@@ -66,7 +63,7 @@ function dateKeyNl() {
   const m = parts.find((p) => p.type === "month")?.value;
   const d = parts.find((p) => p.type === "day")?.value;
 
-  return `${y}-${m}-${d}`; // YYYY-MM-DD
+  return `${y}-${m}-${d}`;
 }
 
 function auditFilePathForToday() {
@@ -107,16 +104,8 @@ function appendAuditLog(text) {
 // channelId -> state
 // Let op: missingValues bevat tijdelijk gevoelige info (alleen in memory, niet in logs).
 const ticketState = new Map();
-// {
-//   approved,
-//   cancelReason?,
-//   rejectReason?,
-//   missingFields?,
-//   missingDataMessageId?,
-//   missingValues?,
-//   adminThreadId?,
-//   memberIntroMessageId?
-// }
+// adminSpaceId -> ticketChannelId
+const adminSpaceToTicket = new Map();
 
 function kaartNaarData(kaartValue) {
   const euro = Number(kaartValue);
@@ -145,7 +134,6 @@ function isAdmin(interaction) {
   return interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels);
 }
 
-// ✅ FIX: voorkom "Unknown interaction" (10062) + ✅ geen ephemeral-deprecation warning meer (gebruik flags)
 async function replyTemp(interaction, content, ms = 8000) {
   const safeTimeout = (fn) => setTimeout(() => fn().catch(() => {}), ms);
 
@@ -201,7 +189,7 @@ function memberCancelDisabledRow() {
   );
 }
 
-function ticketActionRowAdmin() {
+function adminInitialRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("ticket_accept").setLabel("Accepteren").setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId("ticket_reject").setLabel("Afkeuren").setStyle(ButtonStyle.Danger)
@@ -322,10 +310,8 @@ function buildMemberFillRowActive() {
 }
 
 async function logToChannel(guild, message) {
-  // ✅ 1) altijd naar audit log wegschrijven (ook als Discord kanaal niet bereikbaar is)
   appendAuditLog(message);
 
-  // ✅ 2) daarnaast zoals altijd naar Discord log kanaal
   if (!LOG_CHANNEL_ID) return;
   const logChannel = await guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
   if (!logChannel) return;
@@ -337,7 +323,6 @@ function safeForCodeBlock(text) {
   return (text || "").toString().replace(/```/g, "'''\n").replace(/`/g, "'");
 }
 
-// ✅ zoek het laatste bericht met de "Gegevens invullen" knop en disable deze
 async function disableMemberFillButtonInChannel(channel) {
   const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
   if (!messages) return;
@@ -360,7 +345,6 @@ async function disableMemberFillButtonInChannel(channel) {
   await target.edit({ components: newComponents }).catch(() => {});
 }
 
-// ✅ disable de annuleren-knop in de eerste berichtregel van het ticket
 async function disableMemberCancelButtonInChannel(channel) {
   const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
   if (!messages) return;
@@ -383,7 +367,6 @@ async function disableMemberCancelButtonInChannel(channel) {
   await target.edit({ components: newComponents }).catch(() => {});
 }
 
-// ✅ haal de server-naam/nickname op voor DM-aanhef
 async function getMemberDisplayName(guild, userId) {
   try {
     const member = await guild.members.fetch(userId);
@@ -400,7 +383,6 @@ async function getMemberDisplayName(guild, userId) {
   return "lid";
 }
 
-// ✅ maak een veilige channel-name slug van de servernaam / username
 function slugifyChannelName(input) {
   return (input || "")
     .toString()
@@ -412,8 +394,102 @@ function slugifyChannelName(input) {
     .replace(/^\-+|\-+$/g, "");
 }
 
-function isAdminThread(channel) {
+function isPrivateThreadChannel(channel) {
   return channel?.type === ChannelType.PrivateThread;
+}
+
+function isAdminWorkspaceChannel(channel) {
+  if (!channel) return false;
+  if (isPrivateThreadChannel(channel)) return true;
+  return adminSpaceToTicket.has(channel.id);
+}
+
+async function createAdminWorkspaceForTicket(ticketChannel, adminUserId) {
+  const botId = client.user.id;
+
+  try {
+    const starter = await ticketChannel.send("🔐 Adminruimte wordt voorbereid...");
+    const thread = await starter.startThread({
+      name: "admin-acties",
+      autoArchiveDuration: 10080,
+      type: ChannelType.PrivateThread,
+      reason: "Privé admin-acties voor Sebbie voor Cash ticket",
+    });
+
+    if (adminUserId) {
+      await thread.members.add(adminUserId).catch(() => {});
+    }
+
+    await starter.delete().catch(() => {});
+
+    return {
+      channel: thread,
+      type: "thread",
+    };
+  } catch (err) {
+    console.log("⚠️ Privé admin-thread kon niet worden gemaakt, fallback naar verborgen admin-kanaal.");
+
+    const hiddenName = `admin-${ticketChannel.name}`.slice(0, 90);
+
+    const hiddenChannel = await ticketChannel.guild.channels.create({
+      name: hiddenName,
+      type: ChannelType.GuildText,
+      parent: ticketChannel.parentId || undefined,
+      topic: `Adminruimte voor ticket ${ticketChannel.id}`,
+      permissionOverwrites: [
+        { id: ticketChannel.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+        {
+          id: botId,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.ManageChannels,
+          ],
+        },
+        {
+          id: adminUserId,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.ManageChannels,
+          ],
+        },
+      ],
+    });
+
+    return {
+      channel: hiddenChannel,
+      type: "channel",
+    };
+  }
+}
+
+async function getAdminWorkspaceForTicket(ticketChannel) {
+  const state = ticketState.get(ticketChannel.id) || {};
+  const adminSpaceId = state.adminSpaceId;
+  if (!adminSpaceId) return null;
+
+  if (adminSpaceToTicket.has(adminSpaceId)) {
+    return await ticketChannel.guild.channels.fetch(adminSpaceId).catch(() => null);
+  }
+
+  const ch = await ticketChannel.guild.channels.fetch(adminSpaceId).catch(() => null);
+  return ch || null;
+}
+
+async function deleteAdminWorkspaceForTicket(ticketChannel) {
+  const state = ticketState.get(ticketChannel.id) || {};
+  const adminSpaceId = state.adminSpaceId;
+  if (!adminSpaceId) return;
+
+  const ch = await ticketChannel.guild.channels.fetch(adminSpaceId).catch(() => null);
+  if (ch) {
+    await ch.delete("Sebbie voor Cash adminruimte sluiten").catch(() => {});
+  }
+
+  adminSpaceToTicket.delete(adminSpaceId);
 }
 
 async function resolveTicketContext(interaction) {
@@ -422,16 +498,33 @@ async function resolveTicketContext(interaction) {
 
   if (channel.type === ChannelType.GuildText) {
     const meta = parseTicketTopic(channel.topic);
-    if (!meta) return null;
-    return {
-      ticketChannel: channel,
-      currentChannel: channel,
-      adminThread: null,
-      meta,
-    };
+    if (meta) {
+      return {
+        ticketChannel: channel,
+        currentChannel: channel,
+        inAdminWorkspace: false,
+        meta,
+      };
+    }
+
+    if (adminSpaceToTicket.has(channel.id)) {
+      const ticketId = adminSpaceToTicket.get(channel.id);
+      const ticketChannel = await channel.guild.channels.fetch(ticketId).catch(() => null);
+      if (!ticketChannel || ticketChannel.type !== ChannelType.GuildText) return null;
+
+      const ticketMeta = parseTicketTopic(ticketChannel.topic);
+      if (!ticketMeta) return null;
+
+      return {
+        ticketChannel,
+        currentChannel: channel,
+        inAdminWorkspace: true,
+        meta: ticketMeta,
+      };
+    }
   }
 
-  if (isAdminThread(channel)) {
+  if (isPrivateThreadChannel(channel)) {
     const parent = channel.parent;
     if (!parent || parent.type !== ChannelType.GuildText) return null;
 
@@ -441,38 +534,10 @@ async function resolveTicketContext(interaction) {
     return {
       ticketChannel: parent,
       currentChannel: channel,
-      adminThread: channel,
+      inAdminWorkspace: true,
       meta,
     };
   }
-
-  return null;
-}
-
-async function createAdminThreadForTicket(ticketChannel, adminUserId) {
-  const starter = await ticketChannel.send("🔐 Adminruimte wordt voorbereid...");
-  const thread = await starter.startThread({
-    name: "admin-acties",
-    autoArchiveDuration: 10080,
-    type: ChannelType.PrivateThread,
-    reason: "Privé admin-acties voor Sebbie voor Cash ticket",
-  });
-
-  if (adminUserId) {
-    await thread.members.add(adminUserId).catch(() => {});
-  }
-
-  await starter.delete().catch(() => {});
-  return thread;
-}
-
-async function getAdminThreadForTicket(ticketChannel) {
-  const state = ticketState.get(ticketChannel.id) || {};
-  const threadId = state.adminThreadId;
-  if (!threadId) return null;
-
-  const fromGuild = await ticketChannel.guild.channels.fetch(threadId).catch(() => null);
-  if (fromGuild && isAdminThread(fromGuild)) return fromGuild;
 
   return null;
 }
@@ -481,8 +546,6 @@ client.once(Events.ClientReady, (c) => {
   console.log(`✅ Bot is online als: ${c.user.tag}`);
   if (!TICKETS_CATEGORY_ID) console.log("⚠️ Let op: TICKETS_CATEGORY_ID ontbreekt nog in .env");
   if (!LOG_CHANNEL_ID) console.log("⚠️ Let op: LOG_CHANNEL_ID ontbreekt nog in .env (logging werkt dan niet).");
-
-  // ✅ Laat zien waar audit logging naartoe schrijft (handig bij debug)
   console.log(`🧾 Audit log map: ${AUDIT_DIR}`);
   console.log(`🧾 Audit log bestand vandaag: ${auditFilePathForToday()}`);
 });
@@ -537,9 +600,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 PermissionFlagsBits.SendMessages,
                 PermissionFlagsBits.ReadMessageHistory,
                 PermissionFlagsBits.ManageChannels,
-                PermissionFlagsBits.ManageThreads,
-                PermissionFlagsBits.CreatePrivateThreads,
-                PermissionFlagsBits.SendMessagesInThreads,
               ],
             },
             {
@@ -553,9 +613,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 PermissionFlagsBits.SendMessages,
                 PermissionFlagsBits.ReadMessageHistory,
                 PermissionFlagsBits.ManageChannels,
-                PermissionFlagsBits.ManageThreads,
-                PermissionFlagsBits.CreatePrivateThreads,
-                PermissionFlagsBits.SendMessagesInThreads,
               ],
             },
           ],
@@ -571,22 +628,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
           `**Team StreApp**`,
         ].join("\n");
 
-        const introMsg = await ticketChannel.send({
+        await ticketChannel.send({
           content: bericht,
           components: [memberInitialRow()],
         });
 
-        const adminThread = await createAdminThreadForTicket(ticketChannel, interaction.user.id);
+        const adminWorkspace = await createAdminWorkspaceForTicket(ticketChannel, interaction.user.id);
 
         ticketState.set(ticketChannel.id, {
           approved: false,
-          adminThreadId: adminThread.id,
-          memberIntroMessageId: introMsg.id,
+          adminSpaceId: adminWorkspace.channel.id,
+          adminSpaceType: adminWorkspace.type,
         });
 
-        await adminThread.send({
-          content: `🔐 **Admin acties voor** ${ticketChannel}\nGebruik hieronder de knoppen voor de verdere afhandeling.`,
-          components: [ticketActionRowAdmin()],
+        adminSpaceToTicket.set(adminWorkspace.channel.id, ticketChannel.id);
+
+        await adminWorkspace.channel.send({
+          content: `🔐 **Admin acties voor ticket:** ${ticketChannel}`,
+          components: [adminInitialRow()],
         });
 
         await replyTemp(interaction, `✅ Ticket aangemaakt: ${ticketChannel}`);
@@ -604,7 +663,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      const { ticketChannel, currentChannel, adminThread, meta } = ctx;
+      const { ticketChannel, currentChannel, inAdminWorkspace, meta } = ctx;
       const aanvragerId = meta.userId;
       const euro = meta.euro;
       const punten = meta.punten;
@@ -615,8 +674,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!adminThread) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de privé admin-thread.");
+        if (!inAdminWorkspace) {
+          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
           return;
         }
 
@@ -677,8 +736,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!adminThread) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de privé admin-thread.");
+        if (!inAdminWorkspace) {
+          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
           return;
         }
 
@@ -726,8 +785,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!adminThread) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de privé admin-thread.");
+        if (!inAdminWorkspace) {
+          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
           return;
         }
 
@@ -768,7 +827,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
 
         await replyTemp(interaction, "✅ Ticket wordt afgesloten.");
+
+        await deleteAdminWorkspaceForTicket(ticketChannel);
         ticketState.delete(ticketChannel.id);
+
         await ticketChannel.delete("Sebbie voor Cash: geannuleerd").catch(() => {});
         return;
       }
@@ -779,8 +841,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!adminThread) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de privé admin-thread.");
+        if (!inAdminWorkspace) {
+          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
           return;
         }
 
@@ -810,8 +872,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!adminThread) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de privé admin-thread.");
+        if (!inAdminWorkspace) {
+          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
           return;
         }
 
@@ -838,8 +900,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!adminThread) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de privé admin-thread.");
+        if (!inAdminWorkspace) {
+          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
           return;
         }
 
@@ -869,8 +931,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!adminThread) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de privé admin-thread.");
+        if (!inAdminWorkspace) {
+          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
           return;
         }
 
@@ -878,8 +940,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const msgId = state.missingDataMessageId;
 
         if (msgId) {
-          const msg = await currentChannel.messages.fetch(msgId).catch(() => null);
-          if (msg) await msg.delete().catch(() => {});
+          const adminSpace = await getAdminWorkspaceForTicket(ticketChannel);
+          if (adminSpace && adminSpace.messages) {
+            const msg = await adminSpace.messages.fetch(msgId).catch(() => null);
+            if (msg) await msg.delete().catch(() => {});
+          }
         }
 
         ticketState.set(ticketChannel.id, {
@@ -894,22 +959,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      // Lid knop: Gegevens invullen -> modal
       if (interaction.customId === "member_fill_missing_data") {
         if (interaction.channel.type !== ChannelType.GuildText) {
           await replyTemp(interaction, "❌ Dit werkt alleen in het hoofd-ticket.");
           return;
         }
 
-        const meta2 = parseTicketTopic(ticketChannel.topic);
-        if (!meta2) {
-          await replyTemp(interaction, "❌ Dit kanaal lijkt geen Sebbie-ticket te zijn.");
-          return;
-        }
-
-        const aanvragerId2 = meta2.userId;
-
-        if (interaction.user.id !== aanvragerId2) {
+        if (interaction.user.id !== aanvragerId) {
           await replyTemp(interaction, "❌ Alleen de aanvrager kan dit invullen.");
           return;
         }
@@ -982,7 +1038,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      const { ticketChannel, adminThread } = ctx;
+      const { ticketChannel, inAdminWorkspace } = ctx;
 
       if (interaction.customId === "select_missing_fields") {
         if (!isAdmin(interaction)) {
@@ -990,8 +1046,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!adminThread) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de privé admin-thread.");
+        if (!inAdminWorkspace) {
+          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
           return;
         }
 
@@ -1028,7 +1084,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
-      const { ticketChannel, currentChannel, adminThread, meta } = ctx;
+      const { ticketChannel, inAdminWorkspace, meta } = ctx;
       const aanvragerId = meta.userId;
       const euro = meta.euro;
       const punten = meta.punten;
@@ -1039,8 +1095,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!adminThread) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de privé admin-thread.");
+        if (!inAdminWorkspace) {
+          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
           return;
         }
 
@@ -1083,7 +1139,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await replyTemp(interaction, "✅ Afkeuring verstuurd. Ticket wordt afgesloten.");
 
+        await deleteAdminWorkspaceForTicket(ticketChannel);
         ticketState.delete(ticketChannel.id);
+
         await ticketChannel.delete("Sebbie voor Cash: afgekeurd").catch(() => {});
         return;
       }
@@ -1107,9 +1165,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           content: [`🟡 **Aanvraag geannuleerd door lid**`, `Reden: ${reason}`].join("\n"),
         });
 
-        const thread = await getAdminThreadForTicket(ticketChannel);
-        if (thread) {
-          await thread.send({
+        const adminSpace = await getAdminWorkspaceForTicket(ticketChannel);
+        if (adminSpace) {
+          await adminSpace.send({
             content: `🟡 **Lid heeft aanvraag geannuleerd**\nReden: ${reason}`,
             components: [adminCancelRow()],
           });
@@ -1125,8 +1183,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (!adminThread) {
-          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de privé admin-thread.");
+        if (!inAdminWorkspace) {
+          await replyTemp(interaction, "❌ Gebruik deze adminactie alleen in de adminruimte.");
           return;
         }
 
@@ -1178,7 +1236,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await replyTemp(interaction, "✅ Betaald geregistreerd. Ticket wordt gesloten.");
 
+        await deleteAdminWorkspaceForTicket(ticketChannel);
         ticketState.delete(ticketChannel.id);
+
         await ticketChannel.delete(`Sebbie voor Cash: betaald (${agreementNo})`).catch(() => {});
         return;
       }
@@ -1216,8 +1276,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           `✅ Dankjewel! We gaan hiermee verder in de administratie.`,
         ].join("\n"));
 
-        const thread = await getAdminThreadForTicket(ticketChannel);
-        if (thread) {
+        const adminSpace = await getAdminWorkspaceForTicket(ticketChannel);
+        if (adminSpace) {
           const lines = [
             `📨 **Aanvullende gegevens ontvangen (alleen voor admin zichtbaar)**`,
             `Gevraagd: **${human.join(", ")}**`,
@@ -1235,7 +1295,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (copyRow) components.push(copyRow);
           components.push(adminWipeDataRow());
 
-          const msg = await thread.send({ content: lines, components });
+          const msg = await adminSpace.send({ content: lines, components });
 
           ticketState.set(ticketChannel.id, {
             ...state,
